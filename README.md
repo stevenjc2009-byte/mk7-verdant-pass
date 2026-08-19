@@ -16,7 +16,7 @@ all eight European languages.
 <img src="docs/install-qr.png" width="220" alt="Install QR code">
 
 Scan that with FBI's *Remote Install → Scan QR Code*, or download
-[`verdantpass1.1.2.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.2/verdantpass1.1.2.cia)
+[`verdantpass1.1.3.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.3/verdantpass1.1.3.cia)
 and install it with FBI by hand.
 
 Once it is on, later versions install themselves — see [Updates](#updates).
@@ -38,9 +38,45 @@ To go back to normal, open Hotswap and switch Mario Kart 7 to **Stock**.
   *Enable game patching*. Without it Luma ignores the swapped-in files and you
   get stock Kalimari Desert with nothing to say why.
 - **Hotswap**, which is what actually swaps the track in and out.
-- **Mario Kart 7 readable on the console** — a cartridge in the slot or an
-  installed copy. The install works by reading your own game; there is no copy
-  of Nintendo's data inside this app to fall back on.
+- **Your own copy of Mario Kart 7's stock files on the SD card**, in
+  `sdmc:/verdantpass/game/` — see [Giving it the game
+  files](#giving-it-the-game-files). The install works by reading your own game;
+  there is no copy of Nintendo's data inside this app to fall back on.
+
+### Giving it the game files
+
+The console does not let an installed app read another game's files. A title can
+open its own RomFS and nothing else, and the answer to asking anyway is
+`0xD9004676` — *no access rights for this command*. That is not a permission
+this app can request; homebrew that offers the same feature, such as RomFS
+Explorer, marks it `.3dsx`-only for the same reason.
+
+So you hand it the files yourself, once, with **GodMode9**:
+
+1. Boot GodMode9 — hold **START** while powering the console on.
+2. Find Mario Kart 7's NCCH:
+   - **Installed copy** — `[A:] SDCARD` → `title` → `00040000` → `00030700` for
+     Europe (`00030800` Americas, `00030600` Japan, `00030a00` Korea) →
+     `content` → the largest `.app`.
+   - **Cartridge** — `[C:] GAMECART` → the `.3ds` → **A** → *Mount image to
+     drive* → `content0.game`.
+3. Press **A** on it and pick *Mount image to drive*. Open the `romfs` folder
+   that appears.
+4. Copy these nine files out — press **A** on each, then *Copy to 0:/gm9/out*:
+   - `Course/Gn64_KalimariDesert.szs`
+   - `UI/common-ed.szs`, `common-ee.szs`, `common-ef.szs`, `common-ei.szs`,
+     `common-en.szs`, `common-ep.szs`, `common-er.szs`, `common-es.szs`
+5. Move all nine from `0:/gm9/out/` into `0:/verdantpass/game/`. They can sit
+   loose in that one folder; the `Course/` and `UI/` folders do not have to be
+   recreated.
+
+**Or copy the whole thing instead of nine files.** In step 3, rather than
+opening `romfs`, press **A** on `romfs.bin` next to it and *Copy to 0:/gm9/out*,
+then move it to `0:/verdantpass/mk7-romfs.bin`. The app mounts that image
+directly. It is around 600 MB against 2.5 MB for the nine files, so take this
+route only if the card has room to spare.
+
+Either way the files stay on your card and never leave it.
 
 ### Updates
 
@@ -66,11 +102,25 @@ swapped in, Hotswap has renamed its folder away into `/luma/titles/`, and
 writing a fresh copy underneath would leave two of them and a state file that
 disagrees with the disk. Swap back to Stock first.
 
-> *Mario Kart 7 could not be opened.*
+> *Mario Kart 7 is here (…), but the console will not let an installed app read
+> another game's files.*
 
-The app could not mount the game's RomFS. It tries the European, Japanese,
-American and Korean title IDs against both the SD card and the game card. If
-none of them answer, the game is not readable on this console.
+It found your game and was refused. Expected on an installed CIA — follow
+[Giving it the game files](#giving-it-the-game-files) and run it again.
+
+> *Mario Kart 7 was not found on this console, and there is nothing in
+> sdmc:/verdantpass/game/ either.*
+
+Neither route worked. It asked the title database for anything calling itself
+`CTR-P-AMK` on the SD card and the game card, tried the European, American,
+Japanese and Korean title IDs blind, and then looked for the files on the card.
+If you have the game, the SD copy is what you want:
+[Giving it the game files](#giving-it-the-game-files).
+
+> *A file is missing from this copy of Mario Kart 7.*
+
+`sdmc:/verdantpass/game/` exists but one of the nine is not in it. Check all
+nine names against the list above — a missing UI language counts.
 
 ## How it works
 
@@ -86,7 +136,8 @@ data. Building them on-device means shipping none.
 
 So on install the app:
 
-1. Mounts your game's RomFS (`gamefs.c`).
+1. Opens your game's files (`gamefs.c`) — the title's own RomFS when the console
+   permits it, otherwise your copies on the SD card.
 2. Reads `Course/Gn64_KalimariDesert.szs`, decompresses the Yaz0, swaps our
    three entries into the SARC, rebuilds and recompresses (`szs.c`, `sarc.c`,
    `patch.c`).

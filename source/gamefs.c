@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *s_error = "";
 
@@ -38,7 +39,17 @@ static const u64 TITLE_IDS[] = {
 // code lookup off the two hundred-odd system titles a console carries.
 #define GAME_TITLE_HIGH 0x00040000ULL
 
-static bool s_mounted = false;
+// Where the player's own copies of the stock files go when the console will not
+// let this app read the game directly - see the long note in vp_gamefs_open.
+//
+// Two shapes are accepted under here. Either the nine stock files copied
+// straight in (which is what GodMode9 produces, since everything it copies
+// lands in one folder), or a whole dumped RomFS image, which keeps the game's
+// folder tree and is one copy instead of nine.
+#define SD_GAME_DIR   "sdmc:/verdantpass/game"
+#define SD_ROMFS_PATH "/verdantpass/mk7-romfs.bin"
+
+static bool s_mounted = false;      // a RomFS device is mounted under MOUNT_NAME
 static char s_detail[256];
 
 static bool isKnownMk7Id(u64 id)
@@ -100,6 +111,75 @@ static bool findGameOn(FS_MediaType media, u64 *found)
     return present;
 }
 
+// Is there anything at all under the SD folder? Only the folder is checked, not
+// which of the two shapes it holds - the install reads each file by name and
+// says exactly which one is missing, which beats a guess made here.
+static bool sdFolderPresent(void)
+{
+    struct stat st;
+    return stat(SD_GAME_DIR, &st) == 0;
+}
+
+// Where the level 3 image - the part libctru can actually read - starts inside
+// a dumped RomFS.
+//
+// A GodMode9 romfs.bin is the whole IVFC hash tree, and romfsMountFromFile
+// wants the level 3 image inside it: it reads a level 3 header at whatever
+// offset it is handed, without checking. Handing it 0 therefore succeeds and
+// then finds nothing, which is exactly how this failed when first tried -
+// mounted clean, then "A file is missing from this copy of Mario Kart 7"
+// (measured 2026-08-19). Mounting from a title works at 0 because FS hands
+// over the level 3 image already unwrapped.
+//
+// The arithmetic is the same as GodMode9's GetRomFsLvOffset: level 3 sits
+// after the header and the master hash, rounded up to the block size. Measured
+// against a real dump it comes to 0x1000.
+#define IVFC_HEADER_SIZE 0x60
+
+static u32 lv3OffsetIn(Handle fd)
+{
+    u8  head[IVFC_HEADER_SIZE];
+    u32 got = 0;
+
+    if (R_FAILED(FSFILE_Read(fd, &got, 0, head, sizeof(head))) || got != sizeof(head))
+        return 0;
+
+    // No IVFC wrapper means this is already a level 3 image, so mount at 0.
+    if (memcmp(head, "IVFC\x00\x00\x01\x00", 8) != 0) return 0;
+
+    u32 masterHash = 0, blockLog = 0;
+    memcpy(&masterHash, head + 0x08, sizeof(masterHash));
+    memcpy(&blockLog,   head + 0x4C, sizeof(blockLog));
+    if (blockLog >= 32) return 0;
+
+    const u32 block = 1u << blockLog;
+    return (IVFC_HEADER_SIZE + masterHash + block - 1) & ~(block - 1);
+}
+
+// Mounts a dumped RomFS image off the SD card.
+//
+// romfsMountFromFile has no title in it and so no cross-title permission to be
+// refused - this is the same call the mount-from-title path ends in, handed a
+// file instead of an archive.
+static bool mountSdImage(void)
+{
+    Handle fd = 0;
+    Result rc = FSUSER_OpenFileDirectly(&fd, ARCHIVE_SDMC,
+                                        fsMakePath(PATH_EMPTY, ""),
+                                        fsMakePath(PATH_ASCII, SD_ROMFS_PATH),
+                                        FS_OPEN_READ, 0);
+    if (R_FAILED(rc)) return false;
+
+    if (R_FAILED(romfsMountFromFile(fd, lv3OffsetIn(fd), MOUNT_NAME)))
+    {
+        FSFILE_Close(fd);
+        return false;
+    }
+
+    s_mounted = true;
+    return true;
+}
+
 const char *vp_gamefs_open(void)
 {
     if (s_mounted) return MOUNT_NAME ":/";
@@ -154,19 +234,39 @@ const char *vp_gamefs_open(void)
         }
     }
 
-    // Nothing mounted. Say which of the two stories is the true one rather than
-    // the one that is usually true - "you do not have the game" sends a player
-    // who does have it off fixing the wrong thing.
+    // The console will not hand this app another title's files.
+    //
+    // This is not a missing permission that could be added. The measured result
+    // on hardware is 0xD9004676 - FS, "no access rights for this command" - and
+    // the exheader in the shipped CIA already carries the 0x1005 bitmask 3dbrew
+    // says that archive wants, in both the ACI and the AccessDesc. Reading
+    // another title's RomFS is something an installed title is not allowed to
+    // do at all; homebrew that offers it, such as RomFS Explorer, marks that
+    // feature 3DSX-only for exactly this reason. The mount above is kept
+    // because it does work when this same binary is run as a 3DSX.
+    //
+    // So the player's own copies of the stock files are read off the SD card
+    // instead. Nothing about the design changes: this app still ships none of
+    // Nintendo's data and still builds the track from the player's own game.
+    // The bytes just arrive by a route the console permits.
+    if (sdFolderPresent()) return SD_GAME_DIR "/";
+    if (mountSdImage())    return MOUNT_NAME ":/";
+
+    // Nothing worked. Which sentence is printed matters: a player whose game is
+    // sitting right there needs different instructions from one who has not
+    // installed it, and the two used to be told the same thing.
     if (have[0] || have[1])
         snprintf(s_detail, sizeof(s_detail),
-                 "Mario Kart 7 is here (%016llX, %s) but this app could not open "
-                 "it. The console said 0x%08lX.",
+                 "Mario Kart 7 is here (%016llX, %s), but the console will not let "
+                 "an installed app read another game's files (0x%08lX). Copy the 9 "
+                 "stock files into sdmc:/verdantpass/game/ - the README says how.",
                  (unsigned long long)(have[0] ? found[0] : found[1]),
                  have[0] ? "SD" : "cartridge", (unsigned long)told);
     else
         snprintf(s_detail, sizeof(s_detail),
-                 "Mario Kart 7 was not found on this console. The game has to be "
-                 "installed, or the cartridge in the slot. (0x%08lX)",
+                 "Mario Kart 7 was not found on this console, and there is nothing "
+                 "in sdmc:/verdantpass/game/ either. Install the game, or copy the "
+                 "9 stock files there - the README says how. (0x%08lX)",
                  (unsigned long)told);
 
     s_error = s_detail;

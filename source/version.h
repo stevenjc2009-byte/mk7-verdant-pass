@@ -12,7 +12,7 @@
 
 #pragma once
 
-#define VP_VERSION "1.1.2"
+#define VP_VERSION "1.1.3"
 
 // Whether the line above has been filled in. Everything that prints or compares
 // the version goes through this so there is one answer to "do we know".

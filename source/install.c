@@ -47,9 +47,19 @@ static const char *s_detail = NULL;
 // would not be a cosmetic problem: it would name a *different* file, and the
 // install would quietly write to the wrong place. Every caller treats a false
 // return as a hard failure.
+//
+// A head that already ends in a slash does not get a second one. On a RomFS
+// mount that is not cosmetic either: libctru rejects an empty path component
+// outright (romfs_dev.c, "if (!len) return EILSEQ"), so "mk7game://Course/..."
+// cannot open a file that "mk7game:/Course/..." opens fine. Measured
+// 2026-08-19 - the SD image mounted at the right offset and every read still
+// came back missing.
 static bool path_join(char *out, size_t cap, const char *head, const char *tail)
 {
-    int n = snprintf(out, cap, "%s/%s", head, tail);
+    size_t len = strlen(head);
+    const char *sep = (len && head[len - 1] == '/') ? "" : "/";
+
+    int n = snprintf(out, cap, "%s%s%s", head, sep, tail);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -242,14 +252,27 @@ typedef struct {
 } build_ctx_t;
 
 // Reads one file out of the player's game.
+//
+// Two layouts are accepted. A mounted RomFS keeps the game's own folders, so
+// "Course/Gn64_KalimariDesert.szs" resolves as written. Files copied off the
+// game by hand land in one folder instead - GodMode9 puts everything it copies
+// in the same place - so the bare filename is tried as well rather than making
+// the player rebuild a folder tree by hand on a console with no keyboard.
 static vp_result_t read_game_file(const build_ctx_t *ctx, const char *rel, vp_buf *out)
 {
     char path[VP_PATH_MAX];
     if (!path_join(path, sizeof(path), ctx->game_root, rel)) return VP_ERR_GAME_READ;
+
     if (!read_whole(path, out))
     {
-        s_detail = "A file is missing from this copy of Mario Kart 7.";
-        return VP_ERR_GAME_READ;
+        const char *slash = strrchr(rel, '/');
+        if (!slash ||
+            !path_join(path, sizeof(path), ctx->game_root, slash + 1) ||
+            !read_whole(path, out))
+        {
+            s_detail = "A file is missing from this copy of Mario Kart 7.";
+            return VP_ERR_GAME_READ;
+        }
     }
     return VP_OK;
 }
