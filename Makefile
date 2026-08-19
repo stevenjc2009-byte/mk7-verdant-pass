@@ -77,7 +77,7 @@ LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 # left to right, so putting them after -lctru leaves the TLS symbols undefined;
 # -lz last of the four because curl is built with zlib support and pulls inflate
 # out of it. These four are the only reason $(PORTLIBS) is on LIBDIRS below.
-LIBS	:= -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lctru -lm
+LIBS	:= -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

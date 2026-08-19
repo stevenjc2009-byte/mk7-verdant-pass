@@ -1,17 +1,23 @@
 // Verdant Pass installer for Mario Kart 7.
 //
-// This app does one small thing: it writes a custom track onto the SD card in
-// the layout Hotswap reads, so the track shows up in Hotswap's mod list for
-// Mario Kart 7 and can be swapped in and out against stock or CTGP-7.
+// This app builds a custom track onto the SD card in the layout Hotswap reads,
+// so the track shows up in Hotswap's mod list for Mario Kart 7 and can be
+// swapped in and out against stock or CTGP-7.
+//
+// It ships none of Nintendo's data. What it carries is the three files this
+// project generated - the model, the collision mesh and the course layout - and
+// it reads everything else out of the player's own copy of the game, assembling
+// the nine finished files here on the console. See patch.h for the recipe.
 //
 // It deliberately does NOT patch, launch or otherwise touch Mario Kart 7. It
 // writes files into /hotswap/mk7/ and stops. Everything about actually putting
 // those files in front of the game - the rename into /luma/titles/, the
 // bookkeeping, swapping back to stock - is Hotswap's job and stays there.
 //
-// The front end is a plain text console rather than citro2d. There are three
-// buttons and a progress line; a GPU front end would be more code than the
-// install itself and nothing on screen would look better for it.
+// The loop below is a plain 60 Hz repaint. That is not laziness: the updater
+// runs on a worker thread, and a front end that only repaints when something
+// noticed a change is one missed edge away from sitting on "please wait"
+// forever. Painting every frame cannot miss an edge.
 
 #include <3ds.h>
 
@@ -19,154 +25,91 @@
 #include <string.h>
 
 #include "install.h"
+#include "ui.h"
+#include "uimodel.h"
 #include "updater.h"
 #include "version.h"
 
-// ANSI colours the 3DS console understands. Named rather than inlined so the
-// screens stay readable.
-#define C_RESET  "\x1b[0m"
-#define C_TITLE  "\x1b[32;1m"   // green, for the track
-#define C_DIM    "\x1b[37m"
-#define C_WARN   "\x1b[33;1m"
-#define C_ERR    "\x1b[31;1m"
-#define C_OK     "\x1b[32;1m"
-#define C_KEY    "\x1b[36;1m"
+// What the top screen is saying. Set from one place so a message can never be
+// half replaced.
+static char s_message[512];
+static bool s_message_is_error;
 
-static PrintConsole s_top, s_bottom;
-
-// What the top screen is currently saying. Redrawn whole on every change rather
-// than scrolled, so a long error cannot push the header off the screen.
-static char s_status[512];
-static bool s_status_is_error;
-
-// Counted once at boot so the top screen can say what is about to be written
-// before anything is written.
-static int                s_payload_files;
-static unsigned long long s_payload_bytes;
-
-static void set_status(const char *text, bool is_error)
+static void set_message(const char *text, bool is_error)
 {
-    snprintf(s_status, sizeof(s_status), "%s", text ? text : "");
-    s_status_is_error = is_error;
+    snprintf(s_message, sizeof(s_message), "%s", text ? text : "");
+    s_message_is_error = is_error;
 }
 
-// ---------------------------------------------------------------------------
-// Drawing
-// ---------------------------------------------------------------------------
+// Everything the screens read. Rebuilt each frame from the two engines rather
+// than kept in step by hand.
+static ui_screen        s_screen;
+static ui_context       s_ctx;
+static char             s_dest[512];
+static unsigned long long s_track_bytes;
+static bool             s_payload_ok;
 
-static void draw_top(void)
+static void refresh(void)
 {
-    consoleSelect(&s_top);
-    consoleClear();
+    s_ctx.update        = updaterState();
+    s_ctx.busy          = updaterBusy();
+    s_ctx.installed     = vp_is_installed();
+    s_ctx.payload_ok    = s_payload_ok;
+    s_ctx.updater_ready = updaterAvailable();
 
-    printf("\n  " C_TITLE "VERDANT PASS" C_RESET "\n");
-    printf("  " C_DIM "A custom track for Mario Kart 7" C_RESET "\n\n");
+    s_screen.version         = VP_VERSION_SET ? VP_VERSION : NULL;
+    s_screen.track_bytes     = s_track_bytes;
+    s_screen.file_count      = vp_step_count();
+    s_screen.dest            = s_dest;
+    s_screen.installed       = s_ctx.installed;
+    s_screen.message         = s_message[0] ? s_message : NULL;
+    s_screen.message_is_error = s_message_is_error;
+    s_screen.latest_version  = updaterLatestVersion();
 
-    char dest[512];
-    vp_dest_path(dest, sizeof(dest));
-
-    printf("  version  " C_KEY "%s" C_RESET "\n",
-           VP_VERSION_SET ? VP_VERSION : "(unset)");
-    printf("  payload  %d files, %llu KB\n",
-           s_payload_files, s_payload_bytes / 1024);
-    printf("  goes to  " C_DIM "%s" C_RESET "\n", dest + strlen("sdmc:"));
-    printf("  status   %s\n\n",
-           vp_is_installed() ? C_OK "installed" C_RESET
-                             : C_WARN "not installed yet" C_RESET);
-
-    printf("  " C_DIM "----------------------------------------" C_RESET "\n\n");
-
-    if (s_status[0])
-        printf("  %s%s" C_RESET "\n", s_status_is_error ? C_ERR : "", s_status);
-}
-
-static void draw_bottom(void)
-{
-    consoleSelect(&s_bottom);
-    consoleClear();
-
-    bool busy = updaterBusy();
-
-    printf("\n");
-    if (busy)
+    if (s_ctx.busy)
     {
-        // Nothing is offered while the worker owns the job. A cancelled
-        // download leaves a half-written title behind, so there is no way out
-        // on purpose.
-        printf("  " C_DIM "Working. Please wait..." C_RESET "\n\n");
-
-        int pct = updaterProgress();
-        if (pct >= 0)
-        {
-            printf("  [");
-            for (int i = 0; i < 24; i++) putchar(i < pct * 24 / 100 ? '#' : '.');
-            printf("] %3d%%\n", pct);
-        }
-        return;
+        s_screen.busy_label = ui_busy_label(s_ctx.update);
+        s_screen.progress   = updaterProgress();
     }
-
-    if (updaterState() == UPDATE_AVAILABLE)
-    {
-        printf("  " C_WARN "Version %s is available." C_RESET "\n\n",
-               updaterLatestVersion());
-        printf("    " C_KEY "A" C_RESET "      download and install it\n");
-        printf("    " C_KEY "B" C_RESET "      not now\n\n");
-        printf("  " C_DIM "The console will restart into the new\n"
-               "  version, which then writes the new track." C_RESET "\n");
-        return;
-    }
-
-    if (updaterState() == UPDATE_DONE)
-    {
-        printf("  " C_OK "Installed." C_RESET "\n\n");
-        printf("    " C_KEY "A" C_RESET "      restart into the new version\n");
-        return;
-    }
-
-    printf("    " C_KEY "A" C_RESET "      %s Verdant Pass\n",
-           vp_is_installed() ? "reinstall" : "install");
-
-    if (updaterAvailable())
-        printf("    " C_KEY "Y" C_RESET "      check for updates\n");
     else
-        printf("    " C_DIM "Y      check for updates (unavailable)" C_RESET "\n");
-
-    printf("    " C_KEY "START" C_RESET "  exit\n\n");
-
-    printf("  " C_DIM "Then open Hotswap, pick Mario Kart 7,\n"
-           "  and choose Verdant Pass." C_RESET "\n");
-}
-
-static void redraw(void)
-{
-    draw_top();
-    draw_bottom();
+    {
+        s_screen.busy_label = NULL;
+        s_screen.progress   = -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The install
 // ---------------------------------------------------------------------------
 
+// The install is a blocking loop - decompressing and recompressing a three
+// megabyte archive is not something to thread on this hardware - so the frame
+// is driven from inside it. Without this the screen would sit still for the
+// whole job, which is the same failure the updater used to have.
 static void on_progress(const char *name, int done, int total, void *user)
 {
     (void)user;
 
     char line[256];
-    snprintf(line, sizeof(line), "Writing %d/%d  %s", done + 1, total, name);
-    set_status(line, false);
+    snprintf(line, sizeof(line), "Building %d of %d", done + 1, total);
+    set_message(name, false);
 
-    // Painted straight away rather than at the end of the frame: the copy is a
-    // blocking loop, so this is the only chance to show anything at all.
-    draw_top();
-    gfxFlushBuffers();
-    gfxSwapBuffers();
-    gspWaitForVBlank();
+    refresh();
+    s_screen.busy_label = line;
+    s_screen.progress   = total > 0 ? done * 100 / total : -1;
+
+    // The context says busy so the bottom screen shows the wait page and offers
+    // nothing. The real updaterBusy() is false here - this is our own blocking
+    // work, not the worker thread's.
+    ui_context busy = s_ctx;
+    busy.busy = true;
+
+    ui_frame(&s_screen, &busy, -1);
 }
 
 static void run_install(void)
 {
-    set_status("Starting...", false);
-    redraw();
+    set_message("Reading Mario Kart 7...", false);
 
     int files = 0;
     unsigned long long bytes = 0;
@@ -176,15 +119,14 @@ static void run_install(void)
     {
         char line[256];
         snprintf(line, sizeof(line),
-                 "Installed. %d files, %llu KB written.\n\n"
-                 "  Open Hotswap and pick Verdant Pass\n"
-                 "  under Mario Kart 7.",
+                 "Done. %d files, %llu KB written.\n"
+                 "Open Hotswap, pick Mario Kart 7, and choose Verdant Pass.",
                  files, bytes / 1024);
-        set_status(line, false);
+        set_message(line, false);
     }
     else
     {
-        set_status(vp_result_str(r), true);
+        set_message(vp_result_str(r), true);
     }
 }
 
@@ -194,102 +136,126 @@ int main(void)
 {
     gfxInitDefault();
 
-    consoleInit(GFX_TOP, &s_top);
-    consoleInit(GFX_BOTTOM, &s_bottom);
+    if (!ui_init())
+    {
+        gfxExit();
+        return 1;
+    }
 
-    // RomFs is mounted here and owned here. Both the track payload and the
+    // RomFs is mounted here and owned here. Both our three track files and the
     // updater's certificate bundle live in it, so it comes up before either and
     // goes down after both.
     bool romfs_up = R_SUCCEEDED(romfsInit());
 
+    s_payload_ok = romfs_up && vp_payload_ok(&s_track_bytes);
+    vp_dest_path(s_dest, sizeof(s_dest));
+
     if (!romfs_up)
-    {
-        set_status("This build has no track payload attached, so there is "
-                   "nothing to install.", true);
-    }
-    else if (!vp_payload_stat(&s_payload_files, &s_payload_bytes))
-    {
-        set_status("The track payload could not be read out of this app.", true);
-        romfs_up = false;
-    }
+        set_message("This build has no track data attached, so there is nothing "
+                    "to install.", true);
+    else if (!s_payload_ok)
+        set_message("The track data could not be read out of this app.", true);
     else if (vp_mod_is_active())
-    {
         // Said up front rather than only on a failed install: the player should
-        // know before pressing anything that the files are in use.
-        set_status(vp_result_str(VP_ERR_ACTIVE), true);
-    }
+        // know before pressing anything that Hotswap has the files.
+        set_message(vp_result_str(VP_ERR_ACTIVE), true);
 
     // Only meaningful on a CIA build - a bare .3dsx has no AM service - and the
     // update button greys itself out when this fails.
     updaterInit();
 
-    redraw();
+    int selection = 0;
+    updateState seen = updaterState();
 
     while (aptMainLoop())
     {
         hidScanInput();
         u32 down = hidKeysDown();
 
-        bool busy = updaterBusy();
-        updateState before = updaterState();
+        refresh();
 
-        if (!busy)
+        // The worker thread moves the state between frames. Noticing it here is
+        // only for putting its message on screen - the repaint happens anyway,
+        // every frame, so a missed edge costs nothing.
+        if (s_ctx.update != seen)
         {
-            if (before == UPDATE_DONE)
-            {
-                if (down & KEY_A)
-                {
-                    updaterRelaunch();
-                    break;
-                }
-            }
-            else if (before == UPDATE_AVAILABLE)
-            {
-                if (down & KEY_A) updaterStartInstall();
-                if (down & KEY_B) { set_status("Update skipped.", false); redraw(); }
-            }
-            else
-            {
-                if ((down & KEY_A) && romfs_up)
-                {
-                    run_install();
-                    redraw();
-                }
-                if ((down & KEY_Y) && updaterAvailable())
-                {
-                    updaterStartCheck();
-                }
-                if (down & KEY_START) break;
-            }
+            seen = s_ctx.update;
+            if (seen == UPDATE_FAILED)     set_message(updaterMessage(), true);
+            else if (seen != UPDATE_IDLE)  set_message(updaterMessage(), false);
+
+            selection = ui_move_selection(&s_ctx, selection, 0);
+            if (selection < 0) selection = 0;
         }
 
-        // The worker moves the state from another thread, so the screens are
-        // repainted whenever it changes as well as on a button press.
-        if (updaterState() != before || down)
+        ui_action action = UI_ACT_NONE;
+
+        if (!s_ctx.busy)
         {
-            if (updaterState() != before)
+            if (down & KEY_DOWN)  selection = ui_move_selection(&s_ctx, selection, 1);
+            if (down & KEY_UP)    selection = ui_move_selection(&s_ctx, selection, -1);
+            if (down & KEY_A)     action = ui_activate(&s_ctx, selection);
+            if (down & KEY_B)     action = ui_activate(&s_ctx, 1);   // "not now"
+
+            if (down & KEY_TOUCH)
             {
-                updateState now = updaterState();
-                if (now == UPDATE_FAILED)
-                    set_status(updaterMessage(), true);
-                else if (now != UPDATE_IDLE)
-                    set_status(updaterMessage(), false);
+                touchPosition touch;
+                hidTouchRead(&touch);
+
+                int hit = ui_hit_test(&s_ctx, (float)touch.px, (float)touch.py);
+                if (hit >= 0)
+                {
+                    selection = hit;
+                    action = ui_activate(&s_ctx, hit);
+                }
             }
-            redraw();
-        }
-        else if (updaterBusy())
-        {
-            // Repaint anyway while a download is running, so the bar moves.
-            draw_bottom();
+
+            // START always exits, except once an update is installed: leaving
+            // then would strand the player on the old build with the new one
+            // already committed.
+            if ((down & KEY_START) && s_ctx.update != UPDATE_DONE)
+                action = UI_ACT_EXIT;
         }
 
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        switch (action)
+        {
+            case UI_ACT_INSTALL:
+                run_install();
+                break;
+
+            case UI_ACT_CHECK:
+                updaterStartCheck();
+                set_message(updaterMessage(), false);
+                seen = updaterState();
+                break;
+
+            case UI_ACT_UPDATE_INSTALL:
+                updaterStartInstall();
+                seen = updaterState();
+                break;
+
+            case UI_ACT_UPDATE_SKIP:
+                set_message("Update skipped.", false);
+                break;
+
+            case UI_ACT_RELAUNCH:
+                updaterRelaunch();
+                goto done;
+
+            case UI_ACT_EXIT:
+                goto done;
+
+            case UI_ACT_NONE:
+                break;
+        }
+
+        refresh();
+        ui_frame(&s_screen, &s_ctx, selection);
     }
 
+done:
     updaterExit();
     if (romfs_up) romfsExit();
+    ui_exit();
     gfxExit();
     return 0;
 }

@@ -1,10 +1,14 @@
 #include "install.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#include "gamefs.h"
+#include "patch.h"
+#include "szs.h"
 
 // The console's mkdir is the POSIX two-argument one; MinGW's is one argument.
 // The host test harness compiles this exact file, so the difference is bridged
@@ -24,17 +28,14 @@
 #endif
 #define HOTSWAP_ROOT SD_ROOT "hotswap"
 
-// 64KB. The payload is ~2.8MB across nine files, and the whole install is a
-// couple of seconds at this size; a bigger buffer buys nothing measurable and a
-// smaller one turns the SZS file into hundreds of round trips.
-#define COPY_CHUNK (64 * 1024)
-
 // One size for every path buffer in this file. The longest real path is about
-// 80 characters; the headroom is for a deeper payload tree later, and path_join
-// below turns "it did not fit" into an error rather than a wrong filename.
+// 80 characters; the headroom is for a deeper tree later, and path_join below
+// turns "it did not fit" into an error rather than a wrong filename.
 #define VP_PATH_MAX 512
 
-static char s_copy_buffer[COPY_CHUNK];
+// Set by whichever step failed, so vp_result_str can hand the player the real
+// reason rather than a category. Cleared at the top of every install.
+static const char *s_detail = NULL;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -94,6 +95,19 @@ static bool make_dirs(const char *path)
     return vp_mkdir(work) == 0 || errno == EEXIST;
 }
 
+// Creates the directory a file is about to be written into.
+static bool make_parent_dirs(const char *file_path)
+{
+    char dir[VP_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", file_path);
+
+    char *cut = strrchr(dir, '/');
+    if (!cut) return true;
+
+    *cut = '\0';
+    return make_dirs(dir);
+}
+
 static bool path_exists(const char *path)
 {
     struct stat st;
@@ -134,81 +148,83 @@ bool vp_is_installed(void)
     return path_exists(dest);
 }
 
-// ---------------------------------------------------------------------------
-// Walking the payload
-// ---------------------------------------------------------------------------
+int vp_step_count(void) { return 1 + VP_UI_FILE_COUNT; }
 
-// Recurses `src`, and for every regular file calls `visit`. `rel` is the path
-// relative to VP_PAYLOAD_ROOT, which is what the destination is built from.
-//
-// Recursive rather than a hardcoded list of the nine files on purpose: the
-// payload is whatever the build put in romfs/mod, so a track that later ships
-// another file needs a rebuild and nothing else.
-typedef bool (*visit_fn)(const char *src, const char *rel, void *user);
+// The three files this project generated, and the only data this app ships.
+static const char *const PAYLOAD_FILES[] = { "course.bcmdl", "course.kcl", "course.kmp" };
+#define PAYLOAD_FILE_COUNT (int)(sizeof(PAYLOAD_FILES) / sizeof(PAYLOAD_FILES[0]))
 
-static bool walk(const char *src_dir, const char *rel_dir, visit_fn visit, void *user)
+bool vp_payload_ok(unsigned long long *bytes)
 {
-    DIR *dir = opendir(src_dir);
-    if (!dir) return false;
+    unsigned long long total = 0;
 
-    bool ok = true;
-    struct dirent *entry;
-
-    while (ok && (entry = readdir(dir)) != NULL)
+    for (int i = 0; i < PAYLOAD_FILE_COUNT; i++)
     {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-        char src[VP_PATH_MAX], rel[VP_PATH_MAX];
-        if (!path_join(src, sizeof(src), src_dir, entry->d_name)) { ok = false; break; }
-
-        if (rel_dir[0])
-        {
-            if (!path_join(rel, sizeof(rel), rel_dir, entry->d_name)) { ok = false; break; }
-        }
-        else
-        {
-            int n = snprintf(rel, sizeof(rel), "%s", entry->d_name);
-            if (n < 0 || (size_t)n >= sizeof(rel)) { ok = false; break; }
-        }
-
+        char path[VP_PATH_MAX];
         struct stat st;
-        if (stat(src, &st) != 0) { ok = false; break; }
-
-        if (S_ISDIR(st.st_mode))
-            ok = walk(src, rel, visit, user);
-        else
-            ok = visit(src, rel, user);
+        if (!path_join(path, sizeof(path), VP_PAYLOAD_ROOT, PAYLOAD_FILES[i])) return false;
+        if (stat(path, &st) != 0 || st.st_size <= 0) return false;
+        total += (unsigned long long)st.st_size;
     }
 
-    closedir(dir);
-    return ok;
-}
-
-typedef struct {
-    int files;
-    unsigned long long bytes;
-} tally_t;
-
-static bool tally_visit(const char *src, const char *rel, void *user)
-{
-    (void)rel;
-    struct stat st;
-    if (stat(src, &st) != 0) return false;
-
-    tally_t *t = (tally_t *)user;
-    t->files++;
-    t->bytes += (unsigned long long)st.st_size;
+    if (bytes) *bytes = total;
     return true;
 }
 
-bool vp_payload_stat(int *files, unsigned long long *bytes)
-{
-    tally_t t = { 0, 0 };
-    if (!walk(VP_PAYLOAD_ROOT, "", tally_visit, &t)) return false;
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
 
-    if (files) *files = t.files;
-    if (bytes) *bytes = t.bytes;
-    return t.files > 0;
+static bool read_whole(const char *path, vp_buf *out)
+{
+    out->data = NULL;
+    out->size = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long n = ftell(f);
+    if (n <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+
+    unsigned char *data = (unsigned char *)malloc((size_t)n);
+    if (!data) { fclose(f); return false; }
+
+    size_t got = fread(data, 1, (size_t)n, f);
+    fclose(f);
+
+    if (got != (size_t)n) { free(data); return false; }
+
+    out->data = data;
+    out->size = got;
+    return true;
+}
+
+// Writes a buffer and reads its size back.
+//
+// The read-back is not paranoia. A short write to a tired SD card returns
+// success from fwrite and only shows up much later as MK7 hanging on the track
+// load screen, with nothing on the console to say why. Checking here turns a
+// silent bad install into a message.
+static vp_result_t write_whole(const char *path, const vp_buf *buf)
+{
+    if (!make_parent_dirs(path)) return VP_ERR_MKDIR;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return VP_ERR_WRITE;
+
+    bool ok = fwrite(buf->data, 1, buf->size, f) == buf->size;
+
+    // fclose is where a full card actually reports itself, because the last
+    // buffer is flushed here rather than by the fwrite above.
+    if (fclose(f) != 0) ok = false;
+    if (!ok) return VP_ERR_WRITE;
+
+    struct stat st;
+    if (stat(path, &st) != 0 || (unsigned long long)st.st_size != buf->size)
+        return VP_ERR_VERIFY;
+
+    return VP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,86 +232,121 @@ bool vp_payload_stat(int *files, unsigned long long *bytes)
 // ---------------------------------------------------------------------------
 
 typedef struct {
+    const char *game_root;
     char dest_root[VP_PATH_MAX];
     vp_progress_fn progress;
     void *user;
     int done;
     int total;
     unsigned long long bytes;
-    vp_result_t error;
-} copy_ctx_t;
+} build_ctx_t;
 
-// Copies one file and then reads it back to confirm its size.
-//
-// The read-back is not paranoia. A short write to a tired SD card returns
-// success from fwrite and only shows up much later as MK7 hanging on the track
-// load screen, with nothing on the console to say why. Checking here turns a
-// silent bad install into a message.
-static bool copy_visit(const char *src, const char *rel, void *user)
+// Reads one file out of the player's game.
+static vp_result_t read_game_file(const build_ctx_t *ctx, const char *rel, vp_buf *out)
 {
-    copy_ctx_t *ctx = (copy_ctx_t *)user;
-
-    if (ctx->progress) ctx->progress(rel, ctx->done, ctx->total, ctx->user);
-
-    char dest[VP_PATH_MAX];
-    if (!path_join(dest, sizeof(dest), ctx->dest_root, rel))
+    char path[VP_PATH_MAX];
+    if (!path_join(path, sizeof(path), ctx->game_root, rel)) return VP_ERR_GAME_READ;
+    if (!read_whole(path, out))
     {
-        ctx->error = VP_ERR_WRITE;
-        return false;
+        s_detail = "A file is missing from this copy of Mario Kart 7.";
+        return VP_ERR_GAME_READ;
     }
+    return VP_OK;
+}
 
-    // Everything up to the last slash is the directory this file needs.
-    char dir[VP_PATH_MAX];
-    snprintf(dir, sizeof(dir), "%s", dest);
-    char *cut = strrchr(dir, '/');
-    if (cut)
-    {
-        *cut = '\0';
-        if (!make_dirs(dir)) { ctx->error = VP_ERR_MKDIR; return false; }
-    }
+// Writes one finished file into the parked mod folder.
+static vp_result_t write_mod_file(build_ctx_t *ctx, const char *rel, const vp_buf *buf)
+{
+    char path[VP_PATH_MAX];
+    if (!path_join(path, sizeof(path), ctx->dest_root, rel)) return VP_ERR_WRITE;
 
-    FILE *in = fopen(src, "rb");
-    if (!in) { ctx->error = VP_ERR_READ; return false; }
-
-    FILE *out = fopen(dest, "wb");
-    if (!out) { fclose(in); ctx->error = VP_ERR_WRITE; return false; }
-
-    unsigned long long written = 0;
-    bool ok = true;
-
-    for (;;)
-    {
-        size_t got = fread(s_copy_buffer, 1, sizeof(s_copy_buffer), in);
-        if (got == 0) break;
-
-        if (fwrite(s_copy_buffer, 1, got, out) != got)
-        {
-            ctx->error = VP_ERR_WRITE;
-            ok = false;
-            break;
-        }
-        written += got;
-    }
-
-    if (ok && ferror(in)) { ctx->error = VP_ERR_READ; ok = false; }
-
-    fclose(in);
-    // fclose is where a full card actually reports itself, because the last
-    // buffer is flushed here rather than by the fwrite above.
-    if (fclose(out) != 0 && ok) { ctx->error = VP_ERR_WRITE; ok = false; }
-    if (!ok) return false;
-
-    struct stat want, got_st;
-    if (stat(src, &want) != 0 || stat(dest, &got_st) != 0 ||
-        want.st_size != got_st.st_size)
-    {
-        ctx->error = VP_ERR_VERIFY;
-        return false;
-    }
+    vp_result_t r = write_whole(path, buf);
+    if (r != VP_OK) return r;
 
     ctx->done++;
-    ctx->bytes += written;
-    return true;
+    ctx->bytes += buf->size;
+    return VP_OK;
+}
+
+static vp_result_t build_course(build_ctx_t *ctx)
+{
+    if (ctx->progress) ctx->progress(VP_COURSE_FILE, ctx->done, ctx->total, ctx->user);
+
+    // Our three generated files. Loaded here rather than at the top of the
+    // install so they are freed again before the eight language files run --
+    // they are two megabytes, and the console has no room to spare while the
+    // course archive is being rebuilt and recompressed.
+    vp_payload payload = { { NULL, 0 }, { NULL, 0 }, { NULL, 0 } };
+    char path[VP_PATH_MAX];
+    bool loaded =
+        path_join(path, sizeof(path), VP_PAYLOAD_ROOT, "course.bcmdl") &&
+        read_whole(path, &payload.cgfx) &&
+        path_join(path, sizeof(path), VP_PAYLOAD_ROOT, "course.kcl") &&
+        read_whole(path, &payload.kcl) &&
+        path_join(path, sizeof(path), VP_PAYLOAD_ROOT, "course.kmp") &&
+        read_whole(path, &payload.kmp);
+
+    vp_buf stock = { NULL, 0 }, built = { NULL, 0 };
+    vp_result_t r = VP_OK;
+
+    if (!loaded)
+    {
+        s_detail = "The track data inside this app could not be read.";
+        r = VP_ERR_READ;
+    }
+    else if ((r = read_game_file(ctx, VP_COURSE_FILE, &stock)) != VP_OK)
+    {
+        /* s_detail already set */
+    }
+    else if (!vp_patch_course(stock.data, stock.size, &payload, &built))
+    {
+        s_detail = vp_patch_error();
+        r = VP_ERR_PATCH;
+    }
+    else
+    {
+        r = write_mod_file(ctx, VP_COURSE_FILE, &built);
+    }
+
+    vp_buf_free(&built);
+    vp_buf_free(&stock);
+    vp_buf_free(&payload.kmp);
+    vp_buf_free(&payload.kcl);
+    vp_buf_free(&payload.cgfx);
+    return r;
+}
+
+// The eight language archives, each with one string changed: the course name.
+// All of them, not just English -- the name is what the player reads on the cup
+// screen, and a Dutch console showing "Kalimari Desert" would look like the
+// install half worked.
+static vp_result_t build_ui(build_ctx_t *ctx)
+{
+    for (int i = 0; i < VP_UI_FILE_COUNT; i++)
+    {
+        if (ctx->progress) ctx->progress(VP_UI_FILES[i], ctx->done, ctx->total, ctx->user);
+
+        vp_buf stock = { NULL, 0 }, built = { NULL, 0 };
+        vp_result_t r = read_game_file(ctx, VP_UI_FILES[i], &stock);
+
+        if (r == VP_OK)
+        {
+            if (!vp_patch_ui(stock.data, stock.size, &built))
+            {
+                s_detail = vp_patch_error();
+                r = VP_ERR_PATCH;
+            }
+            else
+            {
+                r = write_mod_file(ctx, VP_UI_FILES[i], &built);
+            }
+        }
+
+        vp_buf_free(&built);
+        vp_buf_free(&stock);
+        if (r != VP_OK) return r;
+    }
+    return VP_OK;
 }
 
 vp_result_t vp_install(vp_progress_fn progress, void *user,
@@ -303,6 +354,7 @@ vp_result_t vp_install(vp_progress_fn progress, void *user,
 {
     if (files_written)  *files_written = 0;
     if (bytes_written)  *bytes_written = 0;
+    s_detail = NULL;
 
     // Refuse rather than fight Hotswap for the files. While the mod is swapped
     // in, its `layeredfs` folder has been renamed away into /luma/titles/, and
@@ -311,32 +363,50 @@ vp_result_t vp_install(vp_progress_fn progress, void *user,
     // first is one sentence and cannot corrupt anything.
     if (vp_mod_is_active()) return VP_ERR_ACTIVE;
 
-    copy_ctx_t ctx = { { 0 }, progress, user, 0, 0, 0, VP_OK };
+    const char *game_root = vp_gamefs_open();
+    if (!game_root)
+    {
+        s_detail = vp_gamefs_error();
+        return VP_ERR_GAME;
+    }
+
+    build_ctx_t ctx = { game_root, { 0 }, progress, user, 0, vp_step_count(), 0 };
     vp_dest_path(ctx.dest_root, sizeof(ctx.dest_root));
 
-    if (!vp_payload_stat(&ctx.total, NULL)) return VP_ERR_READ;
-    if (!make_dirs(ctx.dest_root))          return VP_ERR_MKDIR;
+    vp_result_t r = make_dirs(ctx.dest_root) ? VP_OK : VP_ERR_MKDIR;
+    if (r == VP_OK) r = build_course(&ctx);
+    if (r == VP_OK) r = build_ui(&ctx);
 
-    if (!walk(VP_PAYLOAD_ROOT, "", copy_visit, &ctx))
-        return ctx.error != VP_OK ? ctx.error : VP_ERR_READ;
+    vp_gamefs_close();
 
     if (files_written)  *files_written = ctx.done;
     if (bytes_written)  *bytes_written = ctx.bytes;
-    return VP_OK;
+    return r;
 }
 
 const char *vp_result_str(vp_result_t r)
 {
+    // The failures that can carry a real reason from further down say it,
+    // rather than a category the player can do nothing with.
+    if (s_detail && (r == VP_ERR_GAME || r == VP_ERR_GAME_READ ||
+                     r == VP_ERR_PATCH || r == VP_ERR_READ))
+        return s_detail;
+
     switch (r)
     {
-        case VP_OK:         return "Installed.";
-        case VP_ERR_ACTIVE: return "Verdant Pass is swapped in right now. Open Hotswap, "
-                                   "switch Mario Kart 7 back to Stock, then run this again.";
-        case VP_ERR_MKDIR:  return "Could not create the folder on the SD card.";
-        case VP_ERR_READ:   return "Could not read the track out of this app.";
-        case VP_ERR_WRITE:  return "Could not write to the SD card. It may be full or locked.";
-        case VP_ERR_VERIFY: return "A file was written but came back the wrong size. "
-                                   "The SD card may be failing.";
+        case VP_OK:            return "Installed.";
+        case VP_ERR_ACTIVE:    return "Verdant Pass is swapped in right now. Open Hotswap, "
+                                      "switch Mario Kart 7 back to Stock, then run this again.";
+        case VP_ERR_GAME:      return "Mario Kart 7 was not found on this console.";
+        case VP_ERR_MKDIR:     return "Could not create the folder on the SD card.";
+        case VP_ERR_READ:      return "Could not read the track out of this app.";
+        case VP_ERR_GAME_READ: return "Could not read from your copy of Mario Kart 7.";
+        case VP_ERR_PATCH:     return "This copy of Mario Kart 7 is not one this track "
+                                      "was built for.";
+        case VP_ERR_MEMORY:    return "Ran out of memory building the track.";
+        case VP_ERR_WRITE:     return "Could not write to the SD card. It may be full or locked.";
+        case VP_ERR_VERIFY:    return "A file was written but came back the wrong size. "
+                                      "The SD card may be failing.";
     }
     return "Unknown error.";
 }

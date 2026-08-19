@@ -1,51 +1,58 @@
-// Host test for the install engine.
+// Host test for the install layer - everything around the patch engine.
 //
-// install.c is plain POSIX file IO, so the same source that runs on the console
-// compiles and runs here with the two roots pointed at a temporary directory.
-// That covers the parts that can actually go wrong quietly - the recursive walk,
-// mkdir -p, the copy, the size read-back, and reading Hotswap's state file.
+// The patch engine is proven separately by test_patch.c, byte for byte against
+// the archives the PC toolchain built. What is left is the part that decides
+// *where* things go and *when* to refuse: the Hotswap folder layout, the
+// mkdir -p, the read-back after every write, and the refusal to write while
+// Hotswap has the mod swapped in.
 //
-// It does NOT cover romfsInit, the console front end, or AM. Those need the
-// console.
+// This runs the real vp_install against the real ROM extract and the real
+// shipped payload. A stand-in payload would prove nothing about what installs.
 //
-// Build and run with test/run.sh. The three roots are not passed as -D on the
-// command line: MSYS mangles a quoted path inside a -D, which fails as a
-// "missing terminating" character" error a long way from its cause. run.sh
-// writes them into a generated header and force-includes that instead.
+// It does NOT cover romfsMountFromTitle, the console front end, or AM. Those
+// need the console.
+//
+// Build and run with test/run.sh. The roots are not passed as -D on the command
+// line: MSYS mangles a quoted path inside a -D, which fails as a "missing
+// terminating " character" error a long way from its cause. run.sh writes them
+// into a generated header and force-includes that instead.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-#ifdef _WIN32
-#include <direct.h>
-#define make_dir(p) _mkdir(p)
-#else
-#define make_dir(p) mkdir((p), 0777)
-#endif
-
 #include "install.h"
+#include "patch.h"
+#include "szs.h"
 
 static int s_checks, s_failures;
 
 static void check(const char *what, int ok)
 {
     s_checks++;
-    if (!ok)
-    {
-        s_failures++;
-        printf("  FAIL  %s\n", what);
-    }
+    if (!ok) { s_failures++; printf("  FAIL  %s\n", what); }
 }
 
-static void write_file(const char *path, size_t bytes, unsigned char seed)
+static bool load(const char *path, vp_buf *out)
 {
-    FILE *f = fopen(path, "wb");
-    if (!f) { printf("  cannot create %s\n", path); exit(2); }
+    out->data = NULL;
+    out->size = 0;
 
-    for (size_t i = 0; i < bytes; i++) fputc((int)((i + seed) & 0xff), f);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return false; }
+
+    out->data = (unsigned char *)malloc((size_t)n);
+    if (!out->data) { fclose(f); return false; }
+
+    out->size = fread(out->data, 1, (size_t)n, f);
     fclose(f);
+    return out->size == (size_t)n;
 }
 
 static long file_size(const char *path)
@@ -54,151 +61,146 @@ static long file_size(const char *path)
     return stat(path, &st) == 0 ? (long)st.st_size : -1;
 }
 
-// Byte-for-byte, not just the size the installer itself checks. The installer
-// verifying its own copy would pass even if the copy loop were wrong in a way
-// that preserved length, so the test compares content independently.
-static int same_bytes(const char *a, const char *b)
+// Writes a stand-in Hotswap state file, to drive the refusal checks.
+static void write_state(const char *contents)
 {
-    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
-    if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); return 0; }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hotswap/%s/state", SD_ROOT_DIR, VP_GAME_SLUG);
 
-    int same = 1, ca, cb;
-    do {
-        ca = fgetc(fa);
-        cb = fgetc(fb);
-        if (ca != cb) { same = 0; break; }
-    } while (ca != EOF);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  cannot write %s\n", path); return; }
+    fputs(contents, f);
+    fclose(f);
+}
 
-    fclose(fa);
-    fclose(fb);
-    return same;
+static void remove_state(void)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/hotswap/%s/state", SD_ROOT_DIR, VP_GAME_SLUG);
+    remove(path);
 }
 
 static int s_progress_calls;
+static int s_progress_total;
+static bool s_progress_ordered = true;
 
 static void on_progress(const char *name, int done, int total, void *user)
 {
-    (void)name; (void)user;
+    (void)user;
+    if (!name || !name[0]) s_progress_ordered = false;
+    if (done != s_progress_calls) s_progress_ordered = false;   // one per file, in order
     s_progress_calls++;
-    check("progress index is inside the total", done >= 0 && done < total);
+    s_progress_total = total;
 }
 
-// Builds a stand-in payload with the same shape as the real one: files at the
-// top level and files one directory down, because the real payload is
-// Course/Gn64_KalimariDesert.szs plus UI/common-*.szs.
-static void setup(void)
+// The finished file on the card must decompress to the archive the PC toolchain
+// built. Comparing the .szs bytes instead would only be comparing compressors.
+static void check_written(const char *dest_root, const char *rel, const char *ref)
 {
-    char path[640];
+    char path[512], label[256];
+    vp_buf on_card, raw, want;
 
-    make_dir(SD_ROOT_DIR);          // stands in for the SD card itself
+    snprintf(path, sizeof(path), "%s/%s", dest_root, rel);
+    snprintf(label, sizeof(label), "%s written", rel);
+    if (!load(path, &on_card)) { check(label, 0); return; }
+    check(label, 1);
 
-    make_dir(VP_PAYLOAD_ROOT);
-    snprintf(path, sizeof(path), "%s/Course", VP_PAYLOAD_ROOT);
-    make_dir(path);
-    snprintf(path, sizeof(path), "%s/UI", VP_PAYLOAD_ROOT);
-    make_dir(path);
+    snprintf(path, sizeof(path), "%s/%s", REF_DIR, ref);
+    snprintf(label, sizeof(label), "%s matches the PC toolchain's archive", rel);
+    if (!load(path, &want)) { check(label, 0); vp_buf_free(&on_card); return; }
 
-    snprintf(path, sizeof(path), "%s/flat.bin", VP_PAYLOAD_ROOT);
-    write_file(path, 1000, 7);
-    snprintf(path, sizeof(path), "%s/Course/course.szs", VP_PAYLOAD_ROOT);
-    write_file(path, 40000, 19);
-    snprintf(path, sizeof(path), "%s/UI/common-ee.szs", VP_PAYLOAD_ROOT);
-    write_file(path, 2500, 33);
+    check(label, vp_yaz0_decompress(on_card.data, on_card.size, &raw) &&
+                 raw.size == want.size && memcmp(raw.data, want.data, raw.size) == 0);
+
+    vp_buf_free(&raw);
+    vp_buf_free(&want);
+    vp_buf_free(&on_card);
 }
 
 int main(void)
 {
     printf("install engine\n");
-    setup();
-
-    // --- the payload the harness was pointed at -----------------------------
-    int files = 0;
-    unsigned long long bytes = 0;
-    check("payload is readable", vp_payload_stat(&files, &bytes));
-    check("payload has the 3 files the harness made", files == 3);
-    check("payload byte total is right", bytes == 1000 + 2500 + 40000);
-
-    // --- nothing installed yet ---------------------------------------------
-    check("reports not installed before installing", !vp_is_installed());
-    check("no state file means not active", !vp_mod_is_active());
-
-    // --- install ------------------------------------------------------------
-    int written = 0;
-    unsigned long long written_bytes = 0;
-    vp_result_t r = vp_install(on_progress, NULL, &written, &written_bytes);
-
-    check("install succeeded", r == VP_OK);
-    check("wrote every file", written == 3);
-    check("wrote every byte", written_bytes == bytes);
-    check("progress fired once per file", s_progress_calls == 3);
-    check("reports installed afterwards", vp_is_installed());
 
     char dest[512];
     vp_dest_path(dest, sizeof(dest));
 
-    char path[640], src[640];
+    // The folder Hotswap will show, in the layout it expects: the mod's name is
+    // the directory name, and the files sit under layeredfs/romfs.
+    char want_dest[512];
+    snprintf(want_dest, sizeof(want_dest),
+             "%s/hotswap/%s/%s/layeredfs/romfs", SD_ROOT_DIR, VP_GAME_SLUG, VP_MOD_SLUG);
+    check("destination is the Hotswap parked path", strcmp(dest, want_dest) == 0);
 
-    // Top-level file.
-    snprintf(path, sizeof(path), "%s/flat.bin", dest);
-    snprintf(src, sizeof(src), "%s/flat.bin", VP_PAYLOAD_ROOT);
-    check("top-level file landed", file_size(path) == 1000);
-    check("top-level file is byte-identical", same_bytes(src, path));
+    check("nine files to write: the course and eight languages",
+          vp_step_count() == 1 + VP_UI_FILE_COUNT);
+    check("nothing installed yet", !vp_is_installed());
+    check("nothing swapped in yet", !vp_mod_is_active());
 
-    // Nested one level - this is what proves mkdir -p ran for a subdirectory
-    // that did not exist, which is the whole Course/ and UI/ case.
-    snprintf(path, sizeof(path), "%s/Course/course.szs", dest);
-    snprintf(src, sizeof(src), "%s/Course/course.szs", VP_PAYLOAD_ROOT);
-    check("nested file landed", file_size(path) == 40000);
-    check("nested file is byte-identical", same_bytes(src, path));
+    // --- the install ---------------------------------------------------------
 
-    snprintf(path, sizeof(path), "%s/UI/common-ee.szs", dest);
-    check("second nested dir landed", file_size(path) == 2500);
+    int files = -1;
+    unsigned long long bytes = 0;
+    vp_result_t r = vp_install(on_progress, NULL, &files, &bytes);
 
-    // --- reinstall over the top --------------------------------------------
-    // The normal case when a player runs a newer version, and the one that
-    // would break if the copy opened files with "ab" or refused to overwrite.
-    r = vp_install(NULL, NULL, &written, &written_bytes);
-    check("reinstall succeeded", r == VP_OK);
-    check("reinstall wrote every file again", written == 3);
-    snprintf(path, sizeof(path), "%s/Course/course.szs", dest);
-    check("reinstall did not append", file_size(path) == 40000);
+    if (r != VP_OK) printf("  vp_install: %s\n", vp_result_str(r));
+    check("install succeeded", r == VP_OK);
+    check("wrote nine files", files == vp_step_count());
+    check("wrote some bytes", bytes > 1000000);
+    check("progress fired once per file", s_progress_calls == vp_step_count());
+    check("progress reported the right total", s_progress_total == vp_step_count());
+    check("progress counted up in order", s_progress_ordered);
+    check("installed now", vp_is_installed());
 
-    // --- Hotswap says the mod is swapped in ---------------------------------
-    char state[640];
-    snprintf(state, sizeof(state), "%s%s/%s/state", SD_ROOT, "hotswap", VP_GAME_SLUG);
+    printf("  wrote %d files, %llu bytes\n", files, bytes);
 
-    FILE *f = fopen(state, "wb");
-    check("could write a fake state file", f != NULL);
-    if (f)
+    check_written(dest, VP_COURSE_FILE, "built_course.sarc");
+    for (int i = 0; i < VP_UI_FILE_COUNT; i++)
     {
-        fputs("active=Verdant Pass\nlayeredfs=Verdant Pass\nplugins=-\n", f);
-        fclose(f);
+        char ref[64];
+        snprintf(ref, sizeof(ref), "built_ui_%d.sarc", i);
+        check_written(dest, VP_UI_FILES[i], ref);
     }
-    check("detects the mod is active", vp_mod_is_active());
-    check("refuses to install while active",
+
+    // --- reinstalling --------------------------------------------------------
+
+    // Overwrite, not append. Opening the destination in the wrong mode would
+    // double every file and MK7 would fail to load the track, so the size is
+    // recorded and compared rather than the install just being re-run.
+    char course_path[1024];
+    snprintf(course_path, sizeof(course_path), "%s/%s", dest, VP_COURSE_FILE);
+    long first = file_size(course_path);
+
+    s_progress_calls = 0;
+    r = vp_install(NULL, NULL, &files, &bytes);
+    check("reinstall succeeded", r == VP_OK);
+    check("reinstall did not append", file_size(course_path) == first);
+    check("reinstall wrote the same nine files", files == vp_step_count());
+
+    // --- refusing while Hotswap has it swapped in ----------------------------
+
+    write_state("active=" VP_MOD_SLUG "\nlayeredfs=" VP_MOD_SLUG "\nplugins=\n");
+    check("sees its own mod swapped in", vp_mod_is_active());
+    check("refuses to write underneath Hotswap",
           vp_install(NULL, NULL, NULL, NULL) == VP_ERR_ACTIVE);
 
-    // A different mod owning the slot must NOT read as ours. This is the check
-    // that would fail if the comparison were a prefix match rather than a whole
-    // -value one.
-    f = fopen(state, "wb");
-    if (f)
-    {
-        fputs("active=ctgp7\nlayeredfs=ctgp7\nplugins=ctgp7\n", f);
-        fclose(f);
-    }
-    check("another mod owning the slot is not us", !vp_mod_is_active());
-    check("installs again once we do not own the slot",
-          vp_install(NULL, NULL, NULL, NULL) == VP_OK);
+    // Another mod owning the slot is not us.
+    write_state("active=ctgp7\nlayeredfs=ctgp7\nplugins=ctgp7\n");
+    check("another mod in the slot is not us", !vp_mod_is_active());
 
-    // And a value that merely starts the same must not match either.
-    f = fopen(state, "wb");
-    if (f)
-    {
-        fputs("active=-\nlayeredfs=Verdant Pass Extra\nplugins=-\n", f);
-        fclose(f);
-    }
-    check("a longer name starting the same is not us", !vp_mod_is_active());
+    // A whole-value match, not a prefix one: a folder called "Verdant Pass
+    // Extra" is a different mod, and treating it as ours would refuse an
+    // install the player is entitled to.
+    write_state("active=Verdant Pass Extra\nlayeredfs=Verdant Pass Extra\nplugins=\n");
+    check("a longer name that starts the same is not us", !vp_mod_is_active());
+
+    // An older Hotswap wrote no per-slot lines at all.
+    write_state("active=" VP_MOD_SLUG "\n");
+    check("a state file with no layeredfs line is not a match", !vp_mod_is_active());
+
+    remove_state();
+    check("no state file means nothing is swapped in", !vp_mod_is_active());
+    check("installs again once the slot is free",
+          vp_install(NULL, NULL, NULL, NULL) == VP_OK);
 
     printf("%d checks, %d failed\n", s_checks, s_failures);
     return s_failures == 0 ? 0 : 1;
