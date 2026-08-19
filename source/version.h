@@ -2,7 +2,7 @@
 //
 // It is compared numerically against the newest release tag on GitHub, with a
 // leading "v" tolerated on either side, so a tag of "v1.0.0" and a value here
-// of "1.0.0" are the same version. Bump this in the same commit that cuts the
+// of "1.1.2" are the same version. Bump this in the same commit that cuts the
 // release, or the shipped build will offer itself an update forever.
 //
 // Left blank between releases on purpose. While it is blank the updater refuses
@@ -12,7 +12,7 @@
 
 #pragma once
 
-#define VP_VERSION "1.1.1"
+#define VP_VERSION "1.1.2"
 
 // Whether the line above has been filled in. Everything that prints or compares
 // the version goes through this so there is one answer to "do we know".

@@ -32,15 +32,12 @@
 #define VP_REPO_OWNER "stevenjc2009-byte"
 #define VP_REPO_NAME  "mk7-verdant-pass"
 
-// Releases name their asset with the version on the end - verdantpass1.0.0.cia
-// and so on - so there is no single filename to ask for. The updater does not
-// need one: it reads the real download URL out of the API response and takes
-// whatever .cia the release actually carries.
-//
-// This is only the last-resort fallback, used if the API answers with something
-// that cannot be parsed. It resolves only if a release also carries a copy under
-// this fixed name, which is the same copy the install QR code points at.
-#define VP_CIA_ASSET  "verdantpass.cia"
+// Releases name their asset with the version on the end - verdantpass1.1.1.cia
+// and so on - so there is no single filename to ask for, only the fixed part
+// either side of the number. The updater builds the name from the version tag
+// it found, which is what lets it download without reading the JSON API at all.
+#define VP_CIA_PREFIX "verdantpass"
+#define VP_CIA_SUFFIX ".cia"
 
 // Where the updater has got to. The front end draws from this and nothing else.
 // Defined in updatestate.h so the front end can use it without <3ds.h>.

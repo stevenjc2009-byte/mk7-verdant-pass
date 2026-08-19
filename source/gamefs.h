@@ -7,9 +7,15 @@
 // can do directly with romfsMountFromTitle - no dumping, no decryption, and
 // nothing left on the card afterwards.
 //
-// The region is not known in advance, so all four are tried, on the SD card
-// first and then the cartridge slot. A player with the game as a card and a
-// different region's demo installed should still get the right one.
+// The region is not known in advance, so the title database is asked which
+// installed title is Mario Kart 7 - matched on the product code CTR-P-AMK, which
+// every copy carries whatever its region - on the SD card first and then the
+// cartridge slot. Four known title IDs are then tried blind as a floor, in case
+// that lookup does not answer.
+//
+// Asking rather than guessing is also what lets a failure say something true. A
+// copy that is present but will not open is a different problem from a copy that
+// is not there, and the two used to produce the same sentence.
 
 #pragma once
 
