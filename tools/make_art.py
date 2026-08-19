@@ -1,9 +1,16 @@
 """Draws the app's icon and CIA banner.
 
-Both are the same scene: a sunlit gap between two forested ridges, with the
-track's road winding up through it. That is what "Verdant Pass" is, and it reads
-at 48 pixels as well as at 256 because the shapes are big and the palette is
-only four greens deep.
+The **banner** is the scene: a sunlit gap between two forested ridges with the
+track winding up through it. That is what "Verdant Pass" is, and at 256 px there
+is room to say it that way.
+
+The **icon** is not the same picture shrunk. It follows the house style the
+other apps on this console already use - Hotswap, Model Kit, Blocksmith - which
+is one centred, flat-shaded object on a dark rounded tile, not a small
+landscape. A landscape at 48 px turns into three smudges of green; an object
+keeps its silhouette. The object here is an isometric slab of the course:
+grass on top, earth beneath, the road curving across it and a few conifers on
+the verge - a piece of track you could pick up.
 
 Everything is drawn from primitives here rather than exported from anywhere, so
 the art is ours the same way the track data is.
@@ -179,12 +186,145 @@ def scene(size, horizon_frac, detail):
     return img
 
 
+# ---------------------------------------------------------------------------
+# The icon: an isometric slab of the course
+# ---------------------------------------------------------------------------
+
+TILE_BG = (14, 20, 18)          # near-black behind the rounded tile
+TILE = (26, 44, 36)             # the tile itself
+SLAB_TOP = (104, 176, 108)      # grass
+SLAB_LEFT = (52, 106, 64)       # earth, lit side
+SLAB_RIGHT = (26, 62, 40)       # earth, shaded side
+SLAB_EDGE = (22, 54, 36)        # the line where grass meets earth
+ICON_ROAD = (226, 230, 216)
+ICON_ROAD_EDGE = (246, 249, 240)
+ICON_TREE = (20, 56, 36)
+ICON_TREE_LIT = (38, 88, 54)
+
+ISO_A = 0.355                   # half-width of the top face, as a fraction of frame
+ISO_B = 0.180                   # half-height of it - 2:1, the usual isometric ratio
+ISO_D = 0.135                   # how deep the slab is
+
+
+def iso(size, u, v):
+    """Project a point on the slab's top face to the frame.
+
+    (u, v) are 0..1 across the two edges of the top face. The whole icon is
+    built in this space so the road and the trees agree with the slab without
+    anything being positioned by hand.
+    """
+    w, h = size
+    cx, cy = w * 0.5, h * 0.455
+    return (cx + (u - v) * w * ISO_A,
+            cy + (u + v - 1.0) * h * ISO_B)
+
+
+def road_path(size, steps=72):
+    """The course, as a curve across the top face. A single S, corner to corner."""
+    # Runs from the near corner to the far one, and the bend is put on u-v.
+    #
+    # That choice is the whole readability of this icon. u+v is the screen
+    # *vertical*, which the 2:1 projection squashes by more than half, so a
+    # generous S written there comes out about two pixels tall at 48 and the
+    # road looks like a painted stripe. u-v is the screen *horizontal* and is
+    # not foreshortened at all, so the same amplitude actually shows.
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        s = 0.26 + 1.48 * t                      # near corner to far corner
+        q = 0.42 * math.sin(t * math.pi * 1.6)   # the winding, side to side
+        pts.append(iso(size, (s + q) / 2.0, (s - q) / 2.0))
+    return pts
+
+
+def screen_ribbon(draw, pts, half, colour, half_end=None):
+    """A constant-width ribbon along an already-projected path.
+
+    Width is held constant on screen rather than on the face: the face is
+    foreshortened 2:1, so a constant width in face space renders as a road that
+    visibly fattens as it turns, which reads as a mistake.
+    """
+    left, right = [], []
+    n = len(pts) - 1
+    for i, (x, y) in enumerate(pts):
+        ax, ay = pts[max(0, i - 1)]
+        bx, by = pts[min(n, i + 1)]
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy) or 1.0
+        # Widen toward the near end. A dead-constant width makes the slab look
+        # flat, because nothing else in the drawing says which end is closer.
+        k = half if half_end is None else half + (half_end - half) * (i / n)
+        ox, oy = -dy / L * k, dx / L * k
+        left.append((x + ox, y + oy))
+        right.append((x - ox, y - oy))
+    draw.polygon(left + list(reversed(right)), fill=colour)
+
+
+def conifer(draw, x, base_y, height, colour, lit):
+    """Same two-triangle tree as the banner, but with a lit face so it does not
+    read as a flat spike sitting on top of the grass."""
+    half = height * 0.30
+    draw.polygon([(x, base_y - height), (x - half, base_y - height * 0.36),
+                  (x + half, base_y - height * 0.36)], fill=colour)
+    draw.polygon([(x, base_y - height * 0.64), (x - half * 1.18, base_y),
+                  (x + half * 1.18, base_y)], fill=colour)
+    # A sliver down the left of each cone, so the silhouette has a direction.
+    draw.polygon([(x, base_y - height), (x - half, base_y - height * 0.36),
+                  (x - half * 0.30, base_y - height * 0.42)], fill=lit)
+
+
 def make_icon(path):
-    """48x48. Drawn at 4x and reduced, so the curves are not stair-stepped."""
-    big = scene((192, 192), 0.44, detail=3)
-    img = big.resize((48, 48), Image.LANCZOS).convert("RGB")
-    img.save(path)
-    return img
+    """48x48, drawn at 8x and reduced so the isometric edges are not jagged."""
+    w = h = 384
+    size = (w, h)
+    img = Image.new("RGB", size, TILE_BG)
+    d = ImageDraw.Draw(img)
+
+    # The tile. Rounded like every other app's icon on this console, and inset
+    # so the corners of the 48x48 stay dark and the shape reads as a tile.
+    d.rounded_rectangle([w * 0.045, h * 0.045, w * 0.955, h * 0.955],
+                        radius=w * 0.20, fill=TILE)
+
+    top = [iso(size, 0, 0), iso(size, 1, 0), iso(size, 1, 1), iso(size, 0, 1)]
+    depth = h * ISO_D
+
+    # The two visible sides, drawn before the top so the top's edge is crisp.
+    d.polygon([top[3], top[2], (top[2][0], top[2][1] + depth),
+               (top[3][0], top[3][1] + depth)], fill=SLAB_LEFT)
+    d.polygon([top[2], top[1], (top[1][0], top[1][1] + depth),
+               (top[2][0], top[2][1] + depth)], fill=SLAB_RIGHT)
+    d.polygon(top, fill=SLAB_TOP)
+    d.line([top[3], top[2], top[1]], fill=SLAB_EDGE, width=max(1, int(w * 0.008)))
+
+    # The course. Drawn on its own layer and composited through a mask of the
+    # top face: a constant-width ribbon near a corner otherwise hangs off the
+    # side of the slab, which reads as the road floating in mid-air.
+    road_layer = Image.new("RGB", size, SLAB_TOP)
+    rd = ImageDraw.Draw(road_layer)
+    path_pts = road_path(size)
+    screen_ribbon(rd, path_pts, w * 0.022, ICON_ROAD_EDGE, half_end=w * 0.036)
+    screen_ribbon(rd, path_pts, w * 0.015, ICON_ROAD, half_end=w * 0.028)
+
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).polygon(top, fill=255)
+    img.paste(road_layer, (0, 0), mask)
+    d = ImageDraw.Draw(img)
+    d.line([top[3], top[2], top[1]], fill=SLAB_EDGE, width=max(1, int(w * 0.008)))
+
+    # Conifers on the verge, back to front so the near ones overlap the far.
+    # Positions are in face space and kept clear of the road's own corridor.
+    # The road now runs up the middle, so the verges are the left and right
+    # corners - that is |u - v| large. It peaks at 0.42, so 0.48 and beyond is
+    # clear of the carriageway.
+    trees = [(0.06, 0.54), (0.16, 0.72), (0.54, 0.06), (0.72, 0.16)]
+    for u, v in sorted(trees, key=lambda q: q[0] + q[1]):
+        x, y = iso(size, u, v)
+        size_t = h * (0.150 + 0.060 * (u + v) / 2.0)
+        conifer(d, x, y, size_t, ICON_TREE, ICON_TREE_LIT)
+
+    out = img.resize((48, 48), Image.LANCZOS).convert("RGB")
+    out.save(path)
+    return out
 
 
 def find_font(size):

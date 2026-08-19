@@ -16,7 +16,7 @@ all eight European languages.
 <img src="docs/install-qr.png" width="220" alt="Install QR code">
 
 Scan that with FBI's *Remote Install → Scan QR Code*, or download
-[`verdantpass1.1.0.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.0/verdantpass1.1.0.cia)
+[`verdantpass1.1.1.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.1/verdantpass1.1.1.cia)
 and install it with FBI by hand.
 
 Once it is on, later versions install themselves — see [Updates](#updates).
