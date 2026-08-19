@@ -1,0 +1,11 @@
+# Keep LF in the working tree on Windows too. git's autocrlf would otherwise
+# hand devkitPro's make a CRLF Makefile and MSYS a CRLF shell script, both of
+# which fail in ways that point nowhere near the line endings.
+* text=auto eol=lf
+
+*.png binary
+*.wav binary
+*.szs binary
+*.pem binary
+*.cia binary
+*.3dsx binary
