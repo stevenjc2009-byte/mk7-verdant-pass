@@ -16,7 +16,7 @@ all eight European languages.
 <img src="docs/install-qr.png" width="220" alt="Install QR code">
 
 Scan that with FBI's *Remote Install → Scan QR Code*, or download
-[`verdantpass1.1.3.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.3/verdantpass1.1.3.cia)
+[`verdantpass1.1.4.cia`](https://github.com/stevenjc2009-byte/mk7-verdant-pass/releases/download/v1.1.4/verdantpass1.1.4.cia)
 and install it with FBI by hand.
 
 Once it is on, later versions install themselves — see [Updates](#updates).
@@ -38,10 +38,11 @@ To go back to normal, open Hotswap and switch Mario Kart 7 to **Stock**.
   *Enable game patching*. Without it Luma ignores the swapped-in files and you
   get stock Kalimari Desert with nothing to say why.
 - **Hotswap**, which is what actually swaps the track in and out.
-- **Your own copy of Mario Kart 7's stock files on the SD card**, in
-  `sdmc:/verdantpass/game/` — see [Giving it the game
-  files](#giving-it-the-game-files). The install works by reading your own game;
-  there is no copy of Nintendo's data inside this app to fall back on.
+- **Your own copy of Mario Kart 7's stock files on the SD card** — dump them
+  once with GodMode9 and leave them where it puts them; the app collects them
+  from there. See [Giving it the game files](#giving-it-the-game-files). The
+  install works by reading your own game; there is no copy of Nintendo's data
+  inside this app to fall back on.
 
 ### Giving it the game files
 
@@ -66,15 +67,20 @@ So you hand it the files yourself, once, with **GodMode9**:
    - `Course/Gn64_KalimariDesert.szs`
    - `UI/common-ed.szs`, `common-ee.szs`, `common-ef.szs`, `common-ei.szs`,
      `common-en.szs`, `common-ep.szs`, `common-er.szs`, `common-es.szs`
-5. Move all nine from `0:/gm9/out/` into `0:/verdantpass/game/`. They can sit
-   loose in that one folder; the `Course/` and `UI/` folders do not have to be
-   recreated.
+
+That is the whole job — **leave them in `0:/gm9/out/`**. Next time you run the
+app it finds them there, copies all nine into `0:/verdantpass/game/` itself and
+carries straight on with the install. Nothing to move by hand.
+
+If you would rather place them yourself, `0:/verdantpass/game/` is the folder it
+checks first. They can sit loose in it; the `Course/` and `UI/` folders do not
+have to be recreated.
 
 **Or copy the whole thing instead of nine files.** In step 3, rather than
-opening `romfs`, press **A** on `romfs.bin` next to it and *Copy to 0:/gm9/out*,
-then move it to `0:/verdantpass/mk7-romfs.bin`. The app mounts that image
-directly. It is around 600 MB against 2.5 MB for the nine files, so take this
-route only if the card has room to spare.
+opening `romfs`, press **A** on `romfs.bin` next to it and *Copy to 0:/gm9/out*.
+The app mounts that image where it lies — again, no moving it. It is around
+600 MB against 2.5 MB for the nine files, so take this route only if the card
+has room to spare.
 
 Either way the files stay on your card and never leave it.
 
@@ -105,16 +111,18 @@ disagrees with the disk. Swap back to Stock first.
 > *Mario Kart 7 is here (…), but the console will not let an installed app read
 > another game's files.*
 
-It found your game and was refused. Expected on an installed CIA — follow
-[Giving it the game files](#giving-it-the-game-files) and run it again.
+It found your game and was refused, and there was no dump on the card to fall
+back on. Expected on an installed CIA — follow [Giving it the game
+files](#giving-it-the-game-files) and run it again.
 
-> *Mario Kart 7 was not found on this console, and there is nothing in
-> sdmc:/verdantpass/game/ either.*
+> *Mario Kart 7 was not found on this console, and no dump was found in
+> sdmc:/gm9/out or sdmc:/verdantpass/game/ either.*
 
 Neither route worked. It asked the title database for anything calling itself
 `CTR-P-AMK` on the SD card and the game card, tried the European, American,
-Japanese and Korean title IDs blind, and then looked for the files on the card.
-If you have the game, the SD copy is what you want:
+Japanese and Korean title IDs blind, then looked for a dump in `0:/gm9/out/`,
+`0:/gm9/` and the card root as well as `0:/verdantpass/game/`. If you have the
+game, the SD copy is what you want:
 [Giving it the game files](#giving-it-the-game-files).
 
 > *A file is missing from this copy of Mario Kart 7.*

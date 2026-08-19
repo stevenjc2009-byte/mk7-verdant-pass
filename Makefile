@@ -198,6 +198,15 @@ endif
 MAKEROM		:=	$(DEVKITPRO)/tools/bin/makerom
 BANNERTOOL	:=	$(DEVKITPRO)/tools/bin/bannertool
 
+# Everything makerom will pack, because the .rsf says "RootPath: romfs" and so
+# takes the whole tree, not the one file that used to be named here.
+#
+# Naming only romfs/cacert.pem meant a rebuilt track under romfs/mod/ did not
+# make the .cia out of date: `make cia` printed nothing, left the previous
+# payload in place, and still said it was built. A release could ship a track
+# that had already been replaced on disk.
+ROMFS_FILES	:=	$(shell find $(ROMFS) -type f)
+
 .PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
@@ -211,7 +220,7 @@ $(OUTPUT).banner	:	cia/banner.png cia/banner.wav
 	@echo banner ...
 	@$(BANNERTOOL) makebanner -i cia/banner.png -a cia/banner.wav -o $@
 
-$(OUTPUT).cia	:	$(OUTPUT).elf $(OUTPUT).smdh $(OUTPUT).banner verdantpass.rsf romfs/cacert.pem
+$(OUTPUT).cia	:	$(OUTPUT).elf $(OUTPUT).smdh $(OUTPUT).banner verdantpass.rsf $(ROMFS_FILES)
 	@echo $(notdir $@) ...
 	@$(MAKEROM) -f cia -o $@ -elf $(OUTPUT).elf -rsf verdantpass.rsf \
 		-icon $(OUTPUT).smdh -banner $(OUTPUT).banner -exefslogo -target t

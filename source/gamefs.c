@@ -5,6 +5,11 @@
 #include <string.h>
 #include <sys/stat.h>
 
+// For the names of the nine stock files. Nothing in patch.h touches a 3DS API;
+// it is the list itself that is wanted here, so that the folder GodMode9 left
+// the dump in can be recognised without writing those nine names out twice.
+#include "patch.h"
+
 static const char *s_error = "";
 
 const char *vp_gamefs_error(void) { return s_error; }
@@ -47,10 +52,35 @@ static const u64 TITLE_IDS[] = {
 // lands in one folder), or a whole dumped RomFS image, which keeps the game's
 // folder tree and is one copy instead of nine.
 #define SD_GAME_DIR   "sdmc:/verdantpass/game"
+#define SD_GAME_PARENT "sdmc:/verdantpass"
 #define SD_ROMFS_PATH "/verdantpass/mk7-romfs.bin"
 
+// Where a dump is likely to be sitting if the player has not moved it.
+//
+// GodMode9 copies to 0:/gm9/out and nowhere else unless told, so that is the
+// folder a player who followed the README will have left the files in. The
+// other two cost one stat each and cover having dragged them somewhere
+// sensible. Order is most-specific first so a stray copy at the card root
+// never wins over a real dump.
+static const char *const PICKUP_DIRS[] = {
+    "sdmc:/gm9/out",
+    "sdmc:/gm9",
+    "sdmc:",
+};
+#define PICKUP_COUNT (int)(sizeof(PICKUP_DIRS) / sizeof(PICKUP_DIRS[0]))
+
+// The same folders again as FS paths, for a dumped RomFS image. An image is
+// hundreds of megabytes, so it is mounted where it lies rather than copied.
+static const char *const PICKUP_IMAGES[] = {
+    SD_ROMFS_PATH,
+    "/gm9/out/romfs.bin",
+    "/gm9/romfs.bin",
+    "/romfs.bin",
+};
+#define PICKUP_IMAGE_COUNT (int)(sizeof(PICKUP_IMAGES) / sizeof(PICKUP_IMAGES[0]))
+
 static bool s_mounted = false;      // a RomFS device is mounted under MOUNT_NAME
-static char s_detail[256];
+static char s_detail[320];
 
 static bool isKnownMk7Id(u64 id)
 {
@@ -120,6 +150,124 @@ static bool sdFolderPresent(void)
     return stat(SD_GAME_DIR, &st) == 0;
 }
 
+// ---------------------------------------------------------------------------
+// Picking a dump up from where GodMode9 left it
+// ---------------------------------------------------------------------------
+//
+// Asking the player to dump the files is unavoidable - the console will not let
+// this app read them itself. Asking them to then move nine files by hand is
+// not, so it does that part for them.
+
+#define STOCK_COUNT (1 + VP_UI_FILE_COUNT)
+#define GAMEFS_PATH_MAX 512
+
+// The nine stock files by index: the course, then the eight UI archives.
+static const char *stockFile(int i)
+{
+    return (i == 0) ? VP_COURSE_FILE : VP_UI_FILES[i - 1];
+}
+
+static const char *baseName(const char *rel)
+{
+    const char *slash = strrchr(rel, '/');
+    return slash ? slash + 1 : rel;
+}
+
+static void joinPath(char *out, size_t cap, const char *dir, const char *name)
+{
+    const size_t len = strlen(dir);
+    const char  *sep = (len && dir[len - 1] == '/') ? "" : "/";
+    snprintf(out, cap, "%s%s%s", dir, sep, name);
+}
+
+static bool fileExists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// Are all nine here? "flat" is the shape GodMode9 produces, since everything it
+// copies lands in one folder; the other keeps the game's Course/ and UI/ tree,
+// which is what copying the romfs folder wholesale gives.
+static bool dumpIn(const char *dir, bool flat)
+{
+    char path[GAMEFS_PATH_MAX];
+
+    for (int i = 0; i < STOCK_COUNT; i++)
+    {
+        const char *rel = stockFile(i);
+        joinPath(path, sizeof(path), dir, flat ? baseName(rel) : rel);
+        if (!fileExists(path)) return false;
+    }
+    return true;
+}
+
+static bool copyFile(const char *from, const char *to)
+{
+    enum { CHUNK = 32 * 1024 };
+
+    FILE *in = fopen(from, "rb");
+    if (!in) return false;
+
+    FILE *out = fopen(to, "wb");
+    if (!out) { fclose(in); return false; }
+
+    char *buf = (char *)malloc(CHUNK);
+    bool  ok  = buf != NULL;
+
+    while (ok)
+    {
+        size_t got = fread(buf, 1, CHUNK, in);
+        if (got == 0) { ok = feof(in) != 0; break; }
+        if (fwrite(buf, 1, got, out) != got) ok = false;
+    }
+
+    free(buf);
+    fclose(in);
+    if (fclose(out) != 0) ok = false;
+    if (!ok) remove(to);
+    return ok;
+}
+
+// Copies a dump into SD_GAME_DIR, always flat, so a later run finds it in the
+// one place regardless of which shape it arrived in.
+static bool copyDumpInto(const char *dir, bool flat)
+{
+    mkdir(SD_GAME_PARENT, 0777);
+    mkdir(SD_GAME_DIR, 0777);
+
+    for (int i = 0; i < STOCK_COUNT; i++)
+    {
+        const char *rel = stockFile(i);
+        char from[GAMEFS_PATH_MAX], to[GAMEFS_PATH_MAX];
+
+        joinPath(from, sizeof(from), dir, flat ? baseName(rel) : rel);
+        joinPath(to,   sizeof(to),   SD_GAME_DIR, baseName(rel));
+
+        if (!copyFile(from, to)) return false;
+    }
+    return true;
+}
+
+// Looks for a dump the player has not moved, and moves it for them.
+//
+// Returns the root to read the game from, or NULL if there is no dump to find.
+// A failed copy is not fatal: the files are read where they lie instead, so a
+// full card costs speed on the next run rather than the install.
+static const char *pickUpDump(void)
+{
+    for (int d = 0; d < PICKUP_COUNT; d++)
+    {
+        for (int flat = 1; flat >= 0; flat--)
+        {
+            if (!dumpIn(PICKUP_DIRS[d], flat != 0)) continue;
+            if (copyDumpInto(PICKUP_DIRS[d], flat != 0)) return SD_GAME_DIR "/";
+            return PICKUP_DIRS[d];
+        }
+    }
+    return NULL;
+}
+
 // Where the level 3 image - the part libctru can actually read - starts inside
 // a dumped RomFS.
 //
@@ -161,12 +309,12 @@ static u32 lv3OffsetIn(Handle fd)
 // romfsMountFromFile has no title in it and so no cross-title permission to be
 // refused - this is the same call the mount-from-title path ends in, handed a
 // file instead of an archive.
-static bool mountSdImage(void)
+static bool mountImageAt(const char *path)
 {
     Handle fd = 0;
     Result rc = FSUSER_OpenFileDirectly(&fd, ARCHIVE_SDMC,
                                         fsMakePath(PATH_EMPTY, ""),
-                                        fsMakePath(PATH_ASCII, SD_ROMFS_PATH),
+                                        fsMakePath(PATH_ASCII, path),
                                         FS_OPEN_READ, 0);
     if (R_FAILED(rc)) return false;
 
@@ -178,6 +326,15 @@ static bool mountSdImage(void)
 
     s_mounted = true;
     return true;
+}
+
+// The place the README names first, then wherever GodMode9 would have left an
+// image the player has not moved.
+static bool mountSdImage(void)
+{
+    for (int i = 0; i < PICKUP_IMAGE_COUNT; i++)
+        if (mountImageAt(PICKUP_IMAGES[i])) return true;
+    return false;
 }
 
 const char *vp_gamefs_open(void)
@@ -250,7 +407,15 @@ const char *vp_gamefs_open(void)
     // Nintendo's data and still builds the track from the player's own game.
     // The bytes just arrive by a route the console permits.
     if (sdFolderPresent()) return SD_GAME_DIR "/";
-    if (mountSdImage())    return MOUNT_NAME ":/";
+
+    // Nothing in the folder the README names. Before giving up, look where the
+    // dump would still be sitting if the player did the dumping and stopped
+    // there - GodMode9 writes to 0:/gm9/out - and move it across for them. That
+    // was the last step this app made a person do by hand.
+    const char *picked = pickUpDump();
+    if (picked) return picked;
+
+    if (mountSdImage()) return MOUNT_NAME ":/";
 
     // Nothing worked. Which sentence is printed matters: a player whose game is
     // sitting right there needs different instructions from one who has not
@@ -258,15 +423,17 @@ const char *vp_gamefs_open(void)
     if (have[0] || have[1])
         snprintf(s_detail, sizeof(s_detail),
                  "Mario Kart 7 is here (%016llX, %s), but the console will not let "
-                 "an installed app read another game's files (0x%08lX). Copy the 9 "
-                 "stock files into sdmc:/verdantpass/game/ - the README says how.",
+                 "an installed app read another game's files (0x%08lX). Dump the 9 "
+                 "stock files with GodMode9 and leave them in sdmc:/gm9/out - this "
+                 "app collects them from there. The README says how.",
                  (unsigned long long)(have[0] ? found[0] : found[1]),
                  have[0] ? "SD" : "cartridge", (unsigned long)told);
     else
         snprintf(s_detail, sizeof(s_detail),
-                 "Mario Kart 7 was not found on this console, and there is nothing "
-                 "in sdmc:/verdantpass/game/ either. Install the game, or copy the "
-                 "9 stock files there - the README says how. (0x%08lX)",
+                 "Mario Kart 7 was not found on this console, and no dump was found "
+                 "in sdmc:/gm9/out or sdmc:/verdantpass/game/ either. Install the "
+                 "game, or dump the 9 stock files with GodMode9 - the README says "
+                 "how. (0x%08lX)",
                  (unsigned long)told);
 
     s_error = s_detail;
